@@ -441,9 +441,16 @@ def main():
                 print(f"Found: {len(page_urls)} documents")
                 
                 if len(page_urls) == 0:
-                    consecutive_empty += 1
-                    print(f"⚠️  No documents found (empty count: {consecutive_empty})")
-                    # Save HTML for debugging when parser finds nothing (e.g. different layout after challenge)
+                    # Only count as "empty" when response size looks like a real results page (~50–150KB).
+                    # Huge responses (e.g. 565KB after challenge) are wrong layout/parser failure, not end of results.
+                    normal_size = 50_000 <= len(response_text) <= 200_000
+                    if normal_size:
+                        consecutive_empty += 1
+                        print(f"⚠️  No documents found (empty count: {consecutive_empty})")
+                    else:
+                        print(f"⚠️  No documents found but response size {len(response_text):,} bytes (unusual) – treating as parser failure, not end of results")
+                        consecutive_empty = 0  # don't count toward stop
+                    # Save HTML for debugging when parser finds nothing
                     if len(response_text) > 50000:
                         debug_file = os.path.join(args.output_dir, f'debug_empty_page_{page}_{output_filename}.html')
                         with open(debug_file, 'w', encoding='utf-8') as f:

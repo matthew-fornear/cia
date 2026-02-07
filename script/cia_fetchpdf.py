@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-CIA Reading Room: fetch document pages, find PDF links, download PDFs, and OCR to text.
-Reads URLs from a JSONL file (e.g. output from cia_fetchmetadata.py: one JSON object per line with "url" and "title").
-For each URL we fetch the document page, dig through the HTML for the PDF link, download the PDF, then run Tesseract OCR.
+CIA Reading Room: fetch document pages and download PDFs only.
+Reads URLs from JSONL (from cia_fetchmetadata). For each URL: fetch HTML, get PDF URL (regex or fallback), download PDF to output/pdfs/.
+OCR is done separately (e.g. local_pdftotxt or another script).
 """
 
 import argparse
 import os
 import re
+import subprocess
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -18,46 +19,32 @@ except ImportError:
     USE_HTTPCLOAK = False
     import requests
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
-# PDF → text with Tesseract OCR
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    fitz = None
-try:
-    import pytesseract
-    from PIL import Image
-    HAS_OCR = True
-except ImportError:
-    HAS_OCR = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-OCR_DPI = 300
 
 
 def get_base_headers():
-    """Match browser headers to avoid bot challenge."""
+    """Match browser curl that works for PDF: accept, priority, sec-gpc, etc."""
     return {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
-        'cache-control': 'max-age=0',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144"',
+        'priority': 'u=0, i',
+        'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Linux"',
         'sec-fetch-dest': 'document',
         'sec-fetch-mode': 'navigate',
         'sec-fetch-site': 'same-origin',
         'sec-fetch-user': '?1',
+        'sec-gpc': '1',
         'upgrade-insecure-requests': '1',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
     }
 
 
 def get_cookies_from_env():
-    """Load cookies from .env (COOKIE_SESSION, COOKIE_AK_BMSC). Same as cia_fetchmetadata."""
     load_dotenv()
     cookies = {}
     if os.getenv('COOKIE_SESSION'):
@@ -68,43 +55,63 @@ def get_cookies_from_env():
 
 
 def extract_pdf_url(html_content: str, page_url: str) -> str | None:
-    """
-    Dig through document page HTML for the PDF download link.
-    CIA uses links like /readingroom/docs/... or /sites/default/files/... or href ending in .pdf.
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
-    base = page_url.rsplit('/', 1)[0]
-    if not page_url.startswith('http'):
-        base = 'https://www.cia.gov' + base
-
-    # Collect all links that point to a PDF
-    candidates = []
-    for a in soup.find_all('a', href=True):
-        href = (a.get('href') or '').strip()
-        if not href or '.pdf' not in href.lower():
-            continue
-        full = urljoin(page_url, href)
-        if full.lower().endswith('.pdf'):
-            candidates.append(full)
-
-    # Prefer readingroom/docs/ or document-related paths; otherwise first .pdf link
-    for c in candidates:
-        if '/readingroom/docs/' in c or '/readingroom/document/' in c or '/sites/default/files/' in c:
-            return c
-    return candidates[0] if candidates else None
+    """CIA: PDF is always .../readingroom/docs/{DOCID}.pdf with DOCID from document URL (uppercased)."""
+    path = urlparse(page_url).path.strip('/')
+    if 'readingroom/document/' in path or '/readingroom/document/' in page_url:
+        doc_id = path.split('/')[-1].split('?')[0]
+        if doc_id:
+            return urljoin(page_url, f"/readingroom/docs/{doc_id.upper()}.pdf")
+    # Non-CIA or odd URL: try regex in HTML
+    m = re.search(r'href\s*=\s*["\']([^"\']+\.pdf[^"\']*)["\']', html_content, re.I)
+    if m:
+        return urljoin(page_url, m.group(1).strip())
+    return None
 
 
 def slug_from_url(url: str) -> str:
-    """Safe filename base from document URL (e.g. cia-rdp80t00246a029500340001-7)."""
     path = urlparse(url).path.strip('/')
     name = path.split('/')[-1] or 'document'
-    # sanitize
-    name = re.sub(r'[^\w\-.]', '_', name)[:120]
-    return name or 'document'
+    return re.sub(r'[^\w\-.]', '_', name)[:120] or 'document'
+
+
+def download_pdf_curl(pdf_url: str, referer: str, cookies: dict, output_path: str, timeout: int = 60) -> bool:
+    """Download PDF using curl (same as your working terminal command). Returns True if saved a valid PDF."""
+    if not cookies:
+        return False
+    cookie_str = '; '.join(f'{k}={v}' for k, v in cookies.items())
+    args = [
+        'curl', '-s', '-S', '-o', output_path,
+        '--max-time', str(timeout),
+        '-b', cookie_str,
+        '-H', 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        '-H', 'accept-language: en-US,en;q=0.9',
+        '-H', 'priority: u=0, i',
+        '-H', f'referer: {referer}',
+        '-H', 'sec-ch-ua: "Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
+        '-H', 'sec-ch-ua-mobile: ?0',
+        '-H', 'sec-ch-ua-platform: "Linux"',
+        '-H', 'sec-fetch-dest: document',
+        '-H', 'sec-fetch-mode: navigate',
+        '-H', 'sec-fetch-site: same-origin',
+        '-H', 'sec-fetch-user: ?1',
+        '-H', 'sec-gpc: 1',
+        '-H', 'user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+        pdf_url,
+    ]
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout + 5)
+        if r.returncode != 0:
+            return False
+        if not os.path.isfile(output_path):
+            return False
+        with open(output_path, 'rb') as f:
+            magic = f.read(8)
+        return magic.startswith(b'%PDF') and os.path.getsize(output_path) > 500
+    except Exception:
+        return False
 
 
 def load_urls_from_jsonl(path: str) -> list[dict]:
-    """Load list of {url, title} from JSONL file."""
     import json
     out = []
     with open(path, 'r', encoding='utf-8') as f:
@@ -119,61 +126,23 @@ def load_urls_from_jsonl(path: str) -> list[dict]:
     return out
 
 
-def ocr_pdf_to_text(pdf_path: str, out_dir: str) -> str | None:
-    """Extract text from PDF using Tesseract OCR (force OCR on every page). Writes to out_dir/<basename>.txt."""
-    if not fitz:
-        print("  Missing pymupdf: pip install pymupdf")
-        return None
-    if not HAS_OCR:
-        print("  Missing OCR deps: pip install pytesseract Pillow; install tesseract-ocr")
-        return None
-    if not os.path.isfile(pdf_path) or not pdf_path.lower().endswith('.pdf'):
-        return None
-    base = os.path.splitext(os.path.basename(pdf_path))[0]
-    out_path = os.path.join(out_dir, f"{base}.txt")
-    try:
-        doc = fitz.open(pdf_path)
-        chunks = []
-        for i, page in enumerate(doc):
-            # Always run Tesseract on each page (CIA docs are often scans)
-            mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            raw = pytesseract.image_to_string(img) or ""
-            chunks.append(raw)
-        doc.close()
-        text = "\n".join(chunks).strip()
-        os.makedirs(out_dir, exist_ok=True)
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        return out_path
-    except Exception as e:
-        print(f"  OCR error: {e}")
-        return None
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Fetch CIA document pages, download PDFs from HTML links, and OCR to text.'
-    )
+    parser = argparse.ArgumentParser(description='Fetch CIA document pages and download PDFs only (no OCR).')
     parser.add_argument(
         'input',
         nargs='?',
         default=os.path.join(PROJECT_ROOT, 'output', 'SIMULATION.jsonl'),
-        help='Input JSONL file with "url" and "title" per line (default: output/SIMULATION.jsonl)',
+        help='JSONL with "url" (and "title") per line',
     )
-    parser.add_argument('--output-dir', default=os.path.join(PROJECT_ROOT, 'output'), help='Base output directory')
-    parser.add_argument('--pdf-dir', default=None, help='Directory for downloaded PDFs (default: <output-dir>/pdfs)')
-    parser.add_argument('--txt-dir', default=None, help='Directory for OCR text (default: <output-dir>/pdf-txt)')
-    parser.add_argument('--delay', type=float, default=90.0, help='Seconds between requests (default: 90)')
-    parser.add_argument('--overwrite', action='store_true', help='Re-download and re-OCR even if .txt exists')
-    parser.add_argument('--timeout', type=int, default=60, help='Request timeout in seconds (default: 60)')
+    parser.add_argument('--output-dir', default=os.path.join(PROJECT_ROOT, 'output'))
+    parser.add_argument('--pdf-dir', default=None, help='Where to save PDFs (default: <output-dir>/pdfs)')
+    parser.add_argument('--delay', type=float, default=90.0)
+    parser.add_argument('--overwrite', action='store_true', help='Re-download even if PDF exists')
+    parser.add_argument('--timeout', type=int, default=60)
     args = parser.parse_args()
 
     pdf_dir = args.pdf_dir or os.path.join(args.output_dir, 'pdfs')
-    txt_dir = args.txt_dir or os.path.join(args.output_dir, 'pdf-txt')
     os.makedirs(pdf_dir, exist_ok=True)
-    os.makedirs(txt_dir, exist_ok=True)
 
     if not os.path.isfile(args.input):
         print(f"Input file not found: {args.input}")
@@ -181,7 +150,7 @@ def main():
 
     entries = load_urls_from_jsonl(args.input)
     if not entries:
-        print("No URLs found in JSONL.")
+        print("No URLs in JSONL.")
         return 1
 
     load_dotenv()
@@ -190,7 +159,6 @@ def main():
         session = HTTPCloakSession(preset="chrome-143", allow_redirects=False, timeout=args.timeout)
     else:
         session = requests.Session()
-
     for name, value in (cookies or {}).items():
         if USE_HTTPCLOAK:
             session.set_cookie(name, value)
@@ -201,12 +169,11 @@ def main():
     done = 0
     for i, entry in enumerate(entries):
         url = entry.get('url') or entry.get('link')
-        title = (entry.get('title') or '')[:60]
         if not url:
             continue
         slug = slug_from_url(url)
-        txt_path = os.path.join(txt_dir, f"{slug}.txt")
-        if not args.overwrite and os.path.isfile(txt_path):
+        pdf_path = os.path.join(pdf_dir, f"{slug}.pdf")
+        if not args.overwrite and os.path.isfile(pdf_path):
             print(f"[{i+1}/{len(entries)}] Skip (exists): {slug}")
             done += 1
             continue
@@ -216,41 +183,37 @@ def main():
             r = session.get(url, headers={**headers, 'referer': 'https://www.cia.gov/readingroom/'}, timeout=args.timeout)
             r.raise_for_status()
         except Exception as e:
-            print(f"  Failed to fetch page: {e}")
+            print(f"  Failed: {e}")
             time.sleep(args.delay)
             continue
 
         pdf_url = extract_pdf_url(r.text, url)
         if not pdf_url:
-            print(f"  No PDF link found in HTML")
+            print("  No PDF URL")
             time.sleep(args.delay)
             continue
 
-        pdf_path = os.path.join(pdf_dir, f"{slug}.pdf")
-        try:
-            r2 = session.get(pdf_url, headers={**headers, 'referer': url}, timeout=args.timeout)
-            r2.raise_for_status()
-            with open(pdf_path, 'wb') as f:
-                f.write(r2.content)
-        except Exception as e:
-            print(f"  Failed to download PDF: {e}")
+        # Use curl for PDF (same as your working terminal); Python session often gets 302/blank.
+        if not download_pdf_curl(pdf_url, url, cookies, pdf_path, args.timeout):
+            if os.path.isfile(pdf_path):
+                try:
+                    os.remove(pdf_path)
+                except OSError:
+                    pass
+            print("  PDF download failed (curl)")
             time.sleep(args.delay)
             continue
-
-        out_txt = ocr_pdf_to_text(pdf_path, txt_dir)
-        if out_txt:
-            print(f"  → {out_txt}")
-            done += 1
-        else:
-            print(f"  OCR failed for {pdf_path}")
+        size = os.path.getsize(pdf_path)
+        print(f"  → {pdf_path} ({size:,} bytes)")
+        done += 1
 
         if i < len(entries) - 1:
-            print(f"  Waiting {args.delay}s...")
+            print(f"  Waiting {args.delay:.0f}s...")
             time.sleep(args.delay)
 
     if USE_HTTPCLOAK and hasattr(session, 'close'):
         session.close()
-    print(f"\nDone. {done}/{len(entries)} documents written to {txt_dir}")
+    print(f"\nDone. {done}/{len(entries)} PDFs in {pdf_dir}")
     return 0
 
 
